@@ -6,5 +6,6 @@ requests
 python-dateutil
 lxml
 openpyxl
-sqlite3
+
+
 
