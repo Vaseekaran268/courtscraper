@@ -8,6 +8,8 @@ import streamlit as st
 from pathlib import Path
 import io
 import re
+from PyPDF2 import PdfMerger, PdfReader, PdfWriter
+import tempfile
 
 # Import with error handling for optional dependencies
 try:
@@ -44,6 +46,13 @@ except ImportError:
     SELENIUM_AVAILABLE = False
     st.error("Selenium is not installed. Please install it with: pip install selenium")
 
+try:
+    from PyPDF2 import PdfMerger, PdfReader, PdfWriter
+    PYPDF2_AVAILABLE = True
+except ImportError:
+    PYPDF2_AVAILABLE = False
+    st.error("PyPDF2 is not installed. Please install it with: pip install pypdf2")
+
 # ----------------- Configuration -----------------
 ECOURTS_URL = "https://services.ecourts.gov.in/ecourtindia_v6/?p=cause_list/index&app_token=999af70e3228e4c73736b14e53143cc8215edf44df7868a06331996cdf179d97#"
 DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")
@@ -54,9 +63,11 @@ ALL_DEPS_AVAILABLE = all([
     BEAUTIFULSOUP_AVAILABLE,
     DATEUTIL_AVAILABLE,
     PANDAS_AVAILABLE,
-    SELENIUM_AVAILABLE
+    SELENIUM_AVAILABLE,
+    PYPDF2_AVAILABLE
 ])
 
+# ----------------- Database Setup -----------------
 # ----------------- Database Setup -----------------
 def init_db():
     """Initialize SQLite database for storing PDFs and case data"""
@@ -77,7 +88,8 @@ def init_db():
             next_hearing_date TEXT,
             captured_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             pdf_path TEXT,
-            additional_pdfs TEXT
+            additional_pdfs TEXT,
+            merged_pdf_path TEXT
         )
     ''')
     
@@ -94,10 +106,209 @@ def init_db():
         )
     ''')
     
+    # Table for merged PDFs
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS merged_pdfs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            case_id INTEGER,
+            filename TEXT,
+            file_data BLOB,
+            merged_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (case_id) REFERENCES cases (id)
+        )
+    ''')
+    
+    # Check if merged_pdf_path column exists, if not add it
+    cursor.execute("PRAGMA table_info(cases)")
+    columns = [column[1] for column in cursor.fetchall()]
+    
+    if 'merged_pdf_path' not in columns:
+        cursor.execute("ALTER TABLE cases ADD COLUMN merged_pdf_path TEXT")
+        st.info("Added merged_pdf_path column to cases table")
+    
     conn.commit()
     conn.close()
 
-def save_case_to_db(case_data, pdf_path=None, additional_pdfs=None):
+def reset_database():
+    """Reset the database completely (use with caution)"""
+    try:
+        # First, close any existing database connections
+        try:
+            if 'db_conn' in st.session_state:
+                st.session_state.db_conn.close()
+                del st.session_state.db_conn
+        except:
+            pass
+        
+        # Get all active connections and close them
+        import gc
+        for obj in gc.get_objects():
+            if isinstance(obj, sqlite3.Connection):
+                try:
+                    obj.close()
+                except:
+                    pass
+        
+        # Small delay to ensure connections are closed
+        time.sleep(1)
+        
+        conn = sqlite3.connect('ecourts_data.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        # Get list of all tables
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [table[0] for table in cursor.fetchall()]
+        
+        # Disable foreign keys
+        cursor.execute("PRAGMA foreign_keys = OFF")
+        
+        # Drop all tables
+        for table in tables:
+            try:
+                cursor.execute(f"DROP TABLE IF EXISTS {table}")
+            except Exception as e:
+                st.warning(f"Could not drop table {table}: {e}")
+        
+        # Re-enable foreign keys
+        cursor.execute("PRAGMA foreign_keys = ON")
+        
+        conn.commit()
+        conn.close()
+        
+        # Small delay
+        time.sleep(0.5)
+        
+        # Reinitialize database
+        init_db()
+        
+        st.success("✅ Database reset successfully! All tables have been recreated.")
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Error resetting database: {str(e)}")
+        # Try the nuclear option - delete the file
+        try:
+            if os.path.exists('ecourts_data.db'):
+                os.remove('ecourts_data.db')
+            if os.path.exists('ecourts_data.db-journal'):
+                os.remove('ecourts_data.db-journal')
+            init_db()
+            st.success("✅ Database reset using file deletion method!")
+            return True
+        except Exception as e2:
+            st.error(f"❌ Even file deletion failed: {str(e2)}")
+            return False
+
+def update_database_schema():
+    """Update database schema safely"""
+    try:
+        conn = sqlite3.connect('ecourts_data.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        # Check if merged_pdf_path column exists
+        cursor.execute("PRAGMA table_info(cases)")
+        columns = [column[1] for column in cursor.fetchall()]
+        
+        if 'merged_pdf_path' not in columns:
+            cursor.execute("ALTER TABLE cases ADD COLUMN merged_pdf_path TEXT")
+            st.success("✅ Added merged_pdf_path column to cases table")
+        else:
+            st.info("✅ merged_pdf_path column already exists")
+        
+        # Ensure all other tables exist
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS merged_pdfs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id INTEGER,
+                filename TEXT,
+                file_data BLOB,
+                merged_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (case_id) REFERENCES cases (id)
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        st.error(f"Error updating database schema: {e}")
+        return False
+
+# Update the settings_ui function
+def settings_ui():
+    st.header("Settings")
+    
+    st.subheader("Download Directory")
+    st.write(f"Current download directory: `{DOWNLOAD_DIR}`")
+    
+    st.subheader("Database Information")
+    conn = sqlite3.connect('ecourts_data.db', check_same_thread=False)
+    cursor = conn.cursor()
+    
+    # Get table info
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = cursor.fetchall()
+    
+    cursor.execute("SELECT COUNT(*) FROM cases")
+    case_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM pdf_files")
+    pdf_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM merged_pdfs")
+    merged_pdf_count = cursor.fetchone()[0]
+    
+    # Check if merged_pdf_path column exists
+    cursor.execute("PRAGMA table_info(cases)")
+    columns = [column[1] for column in cursor.fetchall()]
+    merged_column_exists = 'merged_pdf_path' in columns
+    
+    conn.close()
+    
+    st.write(f"**Tables in database:** {[table[0] for table in tables]}")
+    st.write(f"**Total cases:** {case_count}")
+    st.write(f"**Total PDF files:** {pdf_count}")
+    st.write(f"**Total merged PDFs:** {merged_pdf_count}")
+    st.write(f"**Merged PDF column exists:** {'✅ Yes' if merged_column_exists else '❌ No'}")
+    
+    # Database maintenance options
+    st.subheader("Database Maintenance")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("🔄 Update Database Schema"):
+            if update_database_schema():
+                st.rerun()
+    
+    with col2:
+        if st.button("🗑️ Reset Database (Dangerous!)", key="reset_db_btn"):
+            st.warning("This will delete ALL data permanently!")
+            if st.checkbox("I understand this will delete all data", key="reset_confirm"):
+                if reset_database():
+                    st.rerun()
+    
+    # Manual SQL execution for advanced users
+    st.subheader("Manual SQL (Advanced)")
+    sql_query = st.text_area("SQL Query (use with caution):", key="sql_query")
+    if st.button("Execute SQL", key="execute_sql"):
+        try:
+            conn = sqlite3.connect('ecourts_data.db', check_same_thread=False)
+            cursor = conn.cursor()
+            cursor.execute(sql_query)
+            
+            if sql_query.strip().lower().startswith('select'):
+                results = cursor.fetchall()
+                st.write("Results:", results)
+            else:
+                conn.commit()
+                st.success("Query executed successfully")
+            
+            conn.close()
+        except Exception as e:
+            st.error(f"SQL Error: {e}")
+
+def save_case_to_db(case_data, pdf_path=None, additional_pdfs=None, merged_pdf_path=None):
     """Save case details to database"""
     conn = sqlite3.connect('ecourts_data.db', check_same_thread=False)
     cursor = conn.cursor()
@@ -106,8 +317,8 @@ def save_case_to_db(case_data, pdf_path=None, additional_pdfs=None):
         INSERT INTO cases (
             serial_number, cnr_number, case_type, court_info, 
             filing_number, registration_number, court_name, 
-            next_hearing_date, pdf_path, additional_pdfs
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            next_hearing_date, pdf_path, additional_pdfs, merged_pdf_path
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         case_data.get('Serial'),
         case_data.get('CNR Number'),
@@ -118,7 +329,8 @@ def save_case_to_db(case_data, pdf_path=None, additional_pdfs=None):
         case_data.get('court_name'),
         str(case_data.get('next_hearing_date')) if case_data.get('next_hearing_date') else None,
         pdf_path,
-        ', '.join(additional_pdfs) if additional_pdfs else None
+        ', '.join(additional_pdfs) if additional_pdfs else None,
+        merged_pdf_path
     ))
     
     case_id = cursor.lastrowid
@@ -148,9 +360,23 @@ def save_case_to_db(case_data, pdf_path=None, additional_pdfs=None):
                 except Exception as e:
                     st.error(f"Error saving additional PDF to database: {e}")
     
+    # Save merged PDF to database
+    if merged_pdf_path and os.path.exists(merged_pdf_path):
+        try:
+            with open(merged_pdf_path, 'rb') as f:
+                merged_pdf_data = f.read()
+            cursor.execute('''
+                INSERT INTO merged_pdfs (case_id, filename, file_data)
+                VALUES (?, ?, ?)
+            ''', (case_id, os.path.basename(merged_pdf_path), merged_pdf_data))
+        except Exception as e:
+            st.error(f"Error saving merged PDF to database: {e}")
+    
     conn.commit()
     conn.close()
     return case_id
+
+
 
 def get_all_cases():
     """Retrieve all cases from database"""
@@ -175,7 +401,195 @@ def get_pdf_from_db(case_id, file_type='main_pdf'):
     conn.close()
     return result
 
-# ----------------- Scraper Functions -----------------
+def get_merged_pdf_from_db(case_id):
+    """Retrieve merged PDF file from database"""
+    conn = sqlite3.connect('ecourts_data.db', check_same_thread=False)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT filename, file_data FROM merged_pdfs 
+        WHERE case_id = ?
+    ''', (case_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result
+
+# ----------------- PDF Processing Functions -----------------
+def merge_pdfs(pdf_files, output_path):
+    """Merge multiple PDF files into a single PDF"""
+    if not PYPDF2_AVAILABLE:
+        st.error("PyPDF2 is not available. Cannot merge PDFs.")
+        return False
+        
+    try:
+        merger = PdfMerger()
+        
+        for pdf_file in pdf_files:
+            if os.path.exists(pdf_file):
+                merger.append(pdf_file)
+        
+        merger.write(output_path)
+        merger.close()
+        return True
+    except Exception as e:
+        st.error(f"Error merging PDFs: {e}")
+        return False
+
+def capture_full_page_pdf(driver, output_path):
+    """Capture the full currently loaded page as a PDF file using Chrome DevTools Protocol."""
+    if not SELENIUM_AVAILABLE:
+        return False
+        
+    try:
+        # Use Chrome DevTools Protocol to print to PDF
+        result = driver.execute_cdp_cmd("Page.printToPDF", {
+            "printBackground": True,
+            "landscape": False,
+            "displayHeaderFooter": False,
+            "scale": 1.0,
+            "paperWidth": 8.27,  # A4 width in inches
+            "paperHeight": 11.69, # A4 height in inches
+            "marginTop": 0.4,
+            "marginBottom": 0.4,
+            "marginLeft": 0.4,
+            "marginRight": 0.4,
+            "pageRanges": "",
+            "ignoreInvalidPageRanges": True,
+            "headerTemplate": "",
+            "footerTemplate": ""
+        })
+        
+        # Decode the base64 PDF data
+        pdf_data = base64.b64decode(result['data'])
+        
+        # Write to file
+        with open(output_path, 'wb') as f:
+            f.write(pdf_data)
+        
+        return True
+    except Exception as e:
+        st.error(f"❌ Failed to save page as PDF: {e}")
+        return False
+
+
+def display_pdf_in_streamlit(pdf_path, key_suffix=""):
+    """Display PDF in Streamlit with download option"""
+    if os.path.exists(pdf_path):
+        try:
+            with open(pdf_path, "rb") as f:
+                pdf_bytes = f.read()
+            
+            # Display PDF using Streamlit's built-in PDF viewer
+            st.subheader("📄 PDF Viewer")
+            
+            # Method 1: Use Streamlit's built-in PDF display (recommended)
+            st.write(f"**Viewing:** {os.path.basename(pdf_path)}")
+            st.write(f"**File size:** {len(pdf_bytes) / 1024:.2f} KB")
+            
+            # Display PDF using st.pdf_display (if available) or fallback to download
+            try:
+                # Try Streamlit's experimental PDF viewer
+                st.components.v1.html(f"""
+                <embed src="data:application/pdf;base64,{base64.b64encode(pdf_bytes).decode('utf-8')}" 
+                       width="100%" height="800" type="application/pdf">
+                """, height=800)
+            except:
+                # Fallback to iframe
+                base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
+                pdf_display = f'''
+                <div style="border: 1px solid #ddd; border-radius: 5px; padding: 10px; background: #f9f9f9;">
+                    <iframe src="data:application/pdf;base64,{base64_pdf}" 
+                            width="100%" height="800" 
+                            style="border: none;">
+                    </iframe>
+                </div>
+                '''
+                st.markdown(pdf_display, unsafe_allow_html=True)
+            
+            # Download button with unique key
+            import time
+            import random
+            unique_key = f"download_{os.path.basename(pdf_path)}_{key_suffix}_{int(time.time()*1000)}_{random.randint(1000,9999)}"
+            
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                st.download_button(
+                    label="📥 Download PDF",
+                    data=pdf_bytes,
+                    file_name=os.path.basename(pdf_path),
+                    mime="application/pdf",
+                    key=unique_key
+                )
+            with col2:
+                st.info(f"💡 If PDF doesn't display, download it using the button above.")
+            
+            return True
+            
+        except Exception as e:
+            st.error(f"❌ Error displaying PDF: {e}")
+            # Still provide download option even if display fails
+            try:
+                with open(pdf_path, "rb") as f:
+                    pdf_bytes = f.read()
+                
+                st.download_button(
+                    label="📥 Download PDF (Display Failed)",
+                    data=pdf_bytes,
+                    file_name=os.path.basename(pdf_path),
+                    mime="application/pdf",
+                    key=f"download_fallback_{key_suffix}"
+                )
+            except:
+                pass
+            return False
+    else:
+        st.error(f"❌ PDF file not found: {pdf_path}")
+        return False
+
+def display_individual_pdfs(case_id, main_pdf_path, additional_pdfs_str):
+    """Display individual PDF files"""
+    import time  # Add this import
+    
+    # Main PDF
+    if main_pdf_path and os.path.exists(main_pdf_path):
+        st.subheader("Main Case PDF")
+        display_pdf_in_streamlit(main_pdf_path, key_suffix=f"main_{case_id}")
+    
+    # Additional PDFs
+    if additional_pdfs_str:
+        additional_pdfs = additional_pdfs_str.split(', ')
+        st.subheader("Additional PDFs")
+        
+        for i, pdf_path in enumerate(additional_pdfs):
+            if os.path.exists(pdf_path.strip()):
+                st.write(f"**File:** {os.path.basename(pdf_path)}")
+                # Use a more descriptive key suffix
+                display_pdf_in_streamlit(pdf_path.strip(), key_suffix=f"additional_{case_id}_{i}_{int(time.time()*1000)}")
+            else:
+                st.warning(f"PDF file not found: {pdf_path}")
+
+def process_case_pdfs(main_pdf_path, additional_pdfs, case_serial):
+    """Process and merge all PDFs for a case"""
+    if not main_pdf_path or not os.path.exists(main_pdf_path):
+        return None
+    
+    # Create list of all PDFs to merge
+    all_pdfs = [main_pdf_path]
+    if additional_pdfs:
+        all_pdfs.extend([pdf for pdf in additional_pdfs if os.path.exists(pdf)])
+    
+    # If only one PDF, no need to merge
+    if len(all_pdfs) == 1:
+        return main_pdf_path
+    
+    # Merge multiple PDFs
+    merged_pdf_path = os.path.join(DOWNLOAD_DIR, f"merged_case_{case_serial}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf")
+    
+    if merge_pdfs(all_pdfs, merged_pdf_path):
+        return merged_pdf_path
+    else:
+        return main_pdf_path  # Return main PDF if merge fails
+
+# ----------------- Enhanced Scraper Functions -----------------
 def setup_driver():
     """Setup Chrome driver with options"""
     if not SELENIUM_AVAILABLE:
@@ -190,19 +604,25 @@ def setup_driver():
         "download.default_directory": DOWNLOAD_DIR,
         "download.prompt_for_download": False,
         "download.directory_upgrade": True,
-        "plugins.always_open_pdf_externally": True
+        "plugins.always_open_pdf_externally": True,
+        "printing.print_to_pdf": True
     })
+    
+    # Enable logging for better debugging
+    chrome_options.set_capability('goog:loggingPrefs', {'browser': 'ALL', 'performance': 'ALL'})
     
     # Check if we're in Streamlit cloud and set appropriate options
     if os.environ.get('STREAMLIT_SHARING_MODE') or os.environ.get('STREAMLIT_SERVER_HEADLESS'):
         chrome_options.add_argument("--headless")
         chrome_options.add_argument("--disable-gpu")
         chrome_options.add_argument("--remote-debugging-port=9222")
+        chrome_options.add_argument("--window-size=1920,1080")
     
     # Try to find Chrome driver automatically
     try:
         driver = webdriver.Chrome(options=chrome_options)
         driver.implicitly_wait(10)
+        driver.set_page_load_timeout(30)
         return driver
     except Exception as e:
         st.error(f"Failed to initialize Chrome driver: {e}")
@@ -257,20 +677,6 @@ def parse_date_nullable(text):
         return dateparser.parse(text, dayfirst=True).date()
     except Exception:
         return None
-
-def save_fullpage_pdf(driver, output_path):
-    """Capture the full currently loaded page as a PDF file."""
-    if not SELENIUM_AVAILABLE:
-        return False
-        
-    try:
-        result = driver.execute_cdp_cmd("Page.printToPDF", {"printBackground": True})
-        data = base64.b64decode(result['data'])
-        Path(output_path).write_bytes(data)
-        return True
-    except Exception as e:
-        st.error(f"❌ Failed to save page as PDF: {e}")
-        return False
 
 def extract_case_details(driver):
     """Extract key case details including correct 16-digit CNR Number."""
@@ -331,7 +737,12 @@ def extract_cases_from_soup(soup_obj):
         if not cols:
             continue
 
+        # Extract the actual serial number from the first column
         serial = cols[0] if cols else ""
+        
+        # Clean the serial number - remove any extra whitespace
+        serial = serial.strip()
+        
         row_text = tr.get_text(" ", strip=True)
         next_hearing_date = None
 
@@ -347,12 +758,14 @@ def extract_cases_from_soup(soup_obj):
             if token and "Next" in row_text:
                 next_hearing_date = parse_date_nullable(token[0])
 
-        cases.append({
-            "serial": serial.strip(),
-            "cols": cols,
-            "court_name": court_name,
-            "next_hearing_date": next_hearing_date,
-        })
+        # Only add cases that have valid serial numbers (not empty and not header-like)
+        if serial and not serial.lower() in ['serial', 'sr.no', 'sr no', 's.no']:
+            cases.append({
+                "serial": serial,
+                "cols": cols,
+                "court_name": court_name,
+                "next_hearing_date": next_hearing_date,
+            })
     return cases
 
 def find_and_click_view_button(driver, serial_number):
@@ -361,31 +774,32 @@ def find_and_click_view_button(driver, serial_number):
         # Wait for the page to load completely
         time.sleep(2)
         
-        # Strategy 1: Look for View links in the entire page and check if they're in the same row as serial
-        view_links = driver.find_elements(By.XPATH, "//a[contains(., 'View') or contains(., 'VIEW')]")
-        
-        for link in view_links:
-            # Get the parent row of this link
-            try:
-                row = link.find_element(By.XPATH, "./ancestor::tr[1]")
-                # Check if this row contains the serial number
-                if serial_number in row.text:
-                    driver.execute_script("arguments[0].click();", link)
-                    time.sleep(3)
-                    return True
-            except:
-                continue
-        
-        # Strategy 2: Find the row with serial number and then find View link in that row
+        # Strategy 1: Look for exact serial number match in the first column
         try:
-            serial_element = driver.find_element(By.XPATH, f"//td[contains(., '{serial_number}')]")
+            # Find the cell that contains exactly the serial number (usually first column)
+            serial_element = driver.find_element(By.XPATH, f"//td[normalize-space()='{serial_number}']")
             row = serial_element.find_element(By.XPATH, "./..")
+            
+            # Look for View links in this specific row
             view_links_in_row = row.find_elements(By.XPATH, ".//a[contains(., 'View') or contains(., 'VIEW')]")
             
             if view_links_in_row:
                 driver.execute_script("arguments[0].click();", view_links_in_row[0])
                 time.sleep(3)
                 return True
+        except:
+            pass
+        
+        # Strategy 2: Look for serial number anywhere in the row and find View button
+        try:
+            rows = driver.find_elements(By.TAG_NAME, "tr")
+            for row in rows:
+                if serial_number in row.text:
+                    view_links = row.find_elements(By.XPATH, ".//a[contains(., 'View') or contains(., 'VIEW')]")
+                    if view_links:
+                        driver.execute_script("arguments[0].click();", view_links[0])
+                        time.sleep(3)
+                        return True
         except:
             pass
         
@@ -398,13 +812,14 @@ def find_and_click_view_button(driver, serial_number):
             if all_links:
                 # Click the first link that's not empty
                 for link in all_links:
-                    if link.text.strip():
+                    if link.text.strip() and link.text.strip().lower() in ['view', 'click here', 'details']:
                         driver.execute_script("arguments[0].click();", link)
                         time.sleep(3)
                         return True
         except:
             pass
         
+        st.warning(f"Could not find View button for serial {serial_number}")
         return False
         
     except Exception as e:
@@ -420,7 +835,9 @@ def click_back_button(driver):
             "//button[contains(., 'Back')]",
             "//input[@value='Back']",
             "//a[contains(@href, 'javascript:history.back()')]",
-            "//a[contains(@onclick, 'back')]"
+            "//a[contains(@onclick, 'back')]",
+            "//a[contains(@class, 'back')]",
+            "//button[contains(@class, 'back')]"
         ]
         
         for selector in back_selectors:
@@ -439,37 +856,44 @@ def click_back_button(driver):
         
     except Exception as e:
         st.error(f"Error clicking back button: {e}")
-        return False
+        # Fallback to browser back
+        try:
+            driver.back()
+            time.sleep(2)
+            return True
+        except:
+            return False
 
+# ----------------- Enhanced Capture Function -----------------
 def capture_case_details_automated(driver, case, status_placeholder):
-    """Automatically capture case details by clicking View button with proper navigation"""
-    serial = case['serial']
+    """Automatically capture case details by clicking View button with proper navigation and PDF processing"""
+    actual_serial = case['serial']  # Use the actual serial from the case data
     
-    # Update status
-    status_placeholder.info(f"🔄 Processing Serial {serial}...")
+    # Update status with ACTUAL serial
+    status_placeholder.info(f"🔄 Processing Serial {actual_serial}...")
     
-    # Click the View button for this serial
-    if find_and_click_view_button(driver, serial):
+    # Click the View button for this ACTUAL serial
+    if find_and_click_view_button(driver, actual_serial):
         # Wait for details page to load
         time.sleep(3)
         
         # Update status
-        status_placeholder.info(f"📄 Serial {serial}: View page loaded, extracting details...")
+        status_placeholder.info(f"📄 Serial {actual_serial}: View page loaded, extracting details...")
         
         # Save full page as PDF
-        pdf_path = os.path.join(DOWNLOAD_DIR, f"serial_{serial}.pdf")
-        pdf_saved = save_fullpage_pdf(driver, pdf_path)
+        pdf_path = os.path.join(DOWNLOAD_DIR, f"serial_{actual_serial}_{datetime.datetime.now().strftime('%H%M%S')}.pdf")
+        pdf_saved = capture_full_page_pdf(driver, pdf_path)
         
         if pdf_saved:
-            status_placeholder.info(f"✅ Serial {serial}: PDF saved successfully")
+            status_placeholder.info(f"✅ Serial {actual_serial}: PDF saved successfully")
         else:
-            status_placeholder.warning(f"❌ Serial {serial}: Failed to save PDF")
+            status_placeholder.warning(f"❌ Serial {actual_serial}: Failed to save PDF")
         
         # Extract case details
         details = extract_case_details(driver)
         
         # Update status
-        status_placeholder.info(f"📊 Serial {serial}: Extracting case information...")
+        status_placeholder.info(f"📊 Serial {actual_serial}: Extracting case information...")
         
         # Download linked PDFs
         soup_now = BeautifulSoup(driver.page_source, "html.parser")
@@ -481,9 +905,14 @@ def capture_case_details_automated(driver, case, status_placeholder):
                 if dl:
                     pdfs.append(dl)
         
-        # Prepare case data
+        # Process and merge PDFs
+        merged_pdf_path = None
+        if pdf_saved or pdfs:
+            merged_pdf_path = process_case_pdfs(pdf_path if pdf_saved else None, pdfs, actual_serial)
+        
+        # Prepare case data with ACTUAL serial
         case_data = {
-            "Serial Number": serial,
+            "Serial Number": actual_serial,  # Use actual serial here
             "CNR Number": details.get('CNR Number'),
             "Case Type": details.get('Case Type'),
             "Court Number and Judge": details.get('Court Number and Judge'),
@@ -493,19 +922,30 @@ def capture_case_details_automated(driver, case, status_placeholder):
             "Next Hearing Date": case['next_hearing_date'],
             "PDF Saved": "✅" if pdf_saved else "❌",
             "Additional PDFs": len(pdfs),
+            "Merged PDF": "✅" if merged_pdf_path else "❌",
             "Status": "✅ Completed"
         }
         
         # Save to database
         case_id = save_case_to_db({
-            "Serial": serial,
+            "Serial": actual_serial,  # Use actual serial here
             "court_name": case['court_name'],
             "next_hearing_date": case['next_hearing_date'],
             **details
-        }, pdf_path if pdf_saved else None, pdfs)
+        }, pdf_path if pdf_saved else None, pdfs, merged_pdf_path)
         
         # Update status
-        status_placeholder.success(f"✅ Serial {serial}: Successfully captured! (ID: {case_id})")
+        status_placeholder.success(f"✅ Serial {actual_serial}: Successfully captured! (ID: {case_id})")
+        
+        # Store PDF paths for later viewing
+        if 'captured_pdfs' not in st.session_state:
+            st.session_state.captured_pdfs = {}
+        st.session_state.captured_pdfs[case_id] = {
+            'main_pdf': pdf_path if pdf_saved else None,
+            'merged_pdf': merged_pdf_path,
+            'additional_pdfs': pdfs,
+            'serial': actual_serial
+        }
         
         # Go back to the main list using back button
         if not click_back_button(driver):
@@ -515,11 +955,11 @@ def capture_case_details_automated(driver, case, status_placeholder):
         
         return case_data
     else:
-        status_placeholder.error(f"❌ Serial {serial}: Could not find View button")
+        status_placeholder.error(f"❌ Serial {actual_serial}: Could not find View button")
         
         # Return partial data for tracking
         return {
-            "Serial Number": serial,
+            "Serial Number": actual_serial,  # Use actual serial here
             "CNR Number": None,
             "Case Type": None,
             "Court Number and Judge": None,
@@ -529,6 +969,7 @@ def capture_case_details_automated(driver, case, status_placeholder):
             "Next Hearing Date": case['next_hearing_date'],
             "PDF Saved": "❌",
             "Additional PDFs": 0,
+            "Merged PDF": "❌",
             "Status": "❌ Failed - No View Button"
         }
 
@@ -553,12 +994,12 @@ def main():
         
         Or install manually:
         ```
-        pip install streamlit selenium beautifulsoup4 pandas requests python-dateutil lxml openpyxl
+        pip install streamlit selenium beautifulsoup4 pandas requests python-dateutil lxml openpyxl pypdf2
         ```
         """)
         return
     
-    # Initialize database
+    # Initialize database - this will handle schema updates
     init_db()
     
     # Initialize session state
@@ -574,21 +1015,27 @@ def main():
         st.session_state.capture_in_progress = False
     if 'current_case_index' not in st.session_state:
         st.session_state.current_case_index = 0
+    if 'captured_pdfs' not in st.session_state:
+        st.session_state.captured_pdfs = {}
+    if 'viewing_pdf_case_id' not in st.session_state:
+        st.session_state.viewing_pdf_case_id = None
     
-    st.title("⚖️ eCourts Case Scraper")
+    st.title("⚖️ eCourts Case Scraper with PDF Capture")
     st.markdown("---")
     
     # Sidebar for navigation
     st.sidebar.title("Navigation")
     app_mode = st.sidebar.selectbox(
         "Choose Mode",
-        ["Scrape Cases", "View Database", "Settings", "Installation Guide"]
+        ["Scrape Cases", "View Database", "PDF Viewer", "Settings", "Installation Guide"]
     )
     
     if app_mode == "Scrape Cases":
         scrape_cases_ui()
     elif app_mode == "View Database":
         view_database_ui()
+    elif app_mode == "PDF Viewer":
+        pdf_viewer_ui()
     elif app_mode == "Settings":
         settings_ui()
     elif app_mode == "Installation Guide":
@@ -830,7 +1277,7 @@ def perform_capture():
         if st.session_state.captured_cases:
             df_excel = pd.DataFrame(st.session_state.captured_cases)
             
-            # Download Excel button
+            # Download Excel button with unique key
             excel_buffer = io.BytesIO()
             with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
                 df_excel.to_excel(writer, index=False, sheet_name='Case Details')
@@ -839,12 +1286,18 @@ def perform_capture():
                 label="📥 Download All Case Details as Excel",
                 data=excel_buffer.getvalue(),
                 file_name=f"case_details_{datetime.date.today()}.xlsx",
-                mime="application/vnd.ms-excel"
+                mime="application/vnd.ms-excel",
+                key="excel_download_final"  # Unique key
             )
             
             # Show final summary
             st.subheader("🎯 Final Capture Summary")
             st.dataframe(df_excel, use_container_width=True)
+            
+            # Show PDF viewing option
+            if st.session_state.captured_pdfs:
+                st.subheader("📄 View Captured PDFs")
+                st.info("Go to 'PDF Viewer' in the sidebar to view and download captured PDFs")
 
 def view_database_ui():
     st.header("Stored Cases Database")
@@ -856,7 +1309,7 @@ def view_database_ui():
         df = pd.DataFrame(cases, columns=[
             'ID', 'Serial', 'CNR', 'Case Type', 'Court Info', 
             'Filing Number', 'Registration Number', 'Court Name',
-            'Next Hearing', 'Captured Date', 'PDF Path', 'Additional PDFs'
+            'Next Hearing', 'Captured Date', 'PDF Path', 'Additional PDFs', 'Merged PDF Path'
         ])
         
         st.dataframe(df)
@@ -869,50 +1322,112 @@ def view_database_ui():
             filtered_df = df[df.apply(lambda row: row.astype(str).str.contains(search_term, case=False).any(), axis=1)]
             st.dataframe(filtered_df)
         
-        # Download full database
+        # Quick PDF viewing options
+        st.subheader("Quick PDF Access")
+        case_ids_with_pdfs = [case[0] for case in cases if case[10] or case[12]]  # ID, PDF Path, Merged PDF Path
+        
+        if case_ids_with_pdfs:
+            selected_case_id = st.selectbox("Select Case to View PDF:", case_ids_with_pdfs)
+            
+            if st.button("View PDF in PDF Viewer", key="view_pdf_button"):
+                st.session_state.viewing_pdf_case_id = selected_case_id
+                st.success("Navigate to 'PDF Viewer' in sidebar to view the PDF")
+        
+        # Download full database with unique key
         excel_buffer = io.BytesIO()
         df.to_excel(excel_buffer, index=False)
         st.download_button(
             label="Download Full Database as Excel",
             data=excel_buffer.getvalue(),
             file_name=f"ecourts_database_{datetime.date.today()}.xlsx",
-            mime="application/vnd.ms-excel"
+            mime="application/vnd.ms-excel",
+            key="database_export"  # Unique key
         )
     
     else:
         st.info("No cases stored in database yet.")
 
-def settings_ui():
-    st.header("Settings")
+def pdf_viewer_ui():
+    st.header("📚 PDF Viewer")
     
-    st.subheader("Download Directory")
-    st.write(f"Current download directory: `{DOWNLOAD_DIR}`")
+    # Troubleshooting info
+    with st.expander("ℹ️ PDF Viewing Help"):
+        st.markdown("""
+        **If PDFs don't display properly:**
+        - Use **'PDF Information & Download'** mode to download files directly
+        - Use **'Text Preview'** mode to see extracted text content
+        - Some PDFs may not display in browser due to security restrictions
+        - Large PDFs might take longer to load
+        
+        **Recommended:** Download the PDFs and view them in your local PDF reader for best experience.
+        """)
     
-    st.subheader("Database Information")
+    # Get all cases with PDFs
+    cases = get_all_cases()
+    
+    if not cases:
+        st.info("No cases with PDFs available. Please scrape some cases first.")
+        return
+    
+    # Create selection interface
+    case_options = []
+    for case in cases:
+        case_id, serial, cnr, case_type, court_info, filing_num, reg_num, court_name, next_hearing, captured_date, pdf_path, additional_pdfs, merged_pdf_path = case
+        has_pdfs = (pdf_path and os.path.exists(pdf_path)) or (merged_pdf_path and os.path.exists(merged_pdf_path))
+        if has_pdfs:
+            display_text = f"Case {case_id} | Serial: {serial} | CNR: {cnr} | PDFs: ✅"
+            case_options.append((case_id, display_text))
+    
+    if not case_options:
+        st.info("No cases with PDFs available.")
+        return
+    
+    selected_case_display = st.selectbox(
+        "Select Case to View PDFs:",
+        options=[opt[1] for opt in case_options],
+        index=0
+    )
+    
+    # Find selected case ID
+    selected_case_id = None
+    for case_id, display_text in case_options:
+        if display_text == selected_case_display:
+            selected_case_id = case_id
+            break
+    
+    if selected_case_id:
+        display_case_pdfs(selected_case_id)
+
+def display_case_pdfs(case_id):
+    """Display PDFs for a specific case"""
+    # Get case details
     conn = sqlite3.connect('ecourts_data.db', check_same_thread=False)
     cursor = conn.cursor()
-    
-    cursor.execute("SELECT COUNT(*) FROM cases")
-    case_count = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM pdf_files")
-    pdf_count = cursor.fetchone()[0]
-    
+    cursor.execute('SELECT * FROM cases WHERE id = ?', (case_id,))
+    case = cursor.fetchone()
     conn.close()
     
-    st.write(f"Total cases in database: {case_count}")
-    st.write(f"Total PDF files stored: {pdf_count}")
+    if not case:
+        st.error("Case not found")
+        return
     
-    # Clear database option
-    if st.button("Clear Database (Dangerous!)"):
-        conn = sqlite3.connect('ecourts_data.db', check_same_thread=False)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM cases")
-        cursor.execute("DELETE FROM pdf_files")
-        conn.commit()
-        conn.close()
-        st.success("Database cleared!")
-        st.rerun()
+    case_id, serial, cnr, case_type, court_info, filing_num, reg_num, court_name, next_hearing, captured_date, pdf_path, additional_pdfs, merged_pdf_path = case
+    
+    st.subheader(f"PDFs for Case: Serial {serial}")
+    st.write(f"**CNR:** {cnr} | **Case Type:** {case_type} | **Court:** {court_name}")
+    
+    # Display merged PDF (preferred)
+    if merged_pdf_path and os.path.exists(merged_pdf_path):
+        st.success("🎉 **Merged PDF Available** (All documents combined)")
+        display_pdf_in_streamlit(merged_pdf_path, f"merged_pdf_{case_id}")
+        # Also show option to download individual PDFs
+        with st.expander("Individual PDF Files"):
+            display_individual_pdfs(case_id, pdf_path, additional_pdfs)
+    else:
+        # Display individual PDFs
+        display_individual_pdfs(case_id, pdf_path, additional_pdfs)
+
+
 
 def installation_guide_ui():
     st.header("Installation Guide")
@@ -920,7 +1435,7 @@ def installation_guide_ui():
     st.subheader("Step 1: Install Dependencies")
     st.code("""
 pip install streamlit==1.28.0 selenium==4.15.0 beautifulsoup4==4.12.2 
-pandas==2.0.3 requests==2.31.0 python-dateutil==2.8.2 lxml==4.9.3 openpyxl==3.1.2
+pandas==2.0.3 requests==2.31.0 python-dateutil==2.8.2 lxml==4.9.3 openpyxl==3.1.2 pypdf2==3.0.1
 """, language="bash")
     
     st.subheader("Step 2: Install Chrome Driver")
@@ -932,6 +1447,16 @@ pandas==2.0.3 requests==2.31.0 python-dateutil==2.8.2 lxml==4.9.3 openpyxl==3.1.
     
     st.subheader("Step 3: Run the Application")
     st.code("streamlit run app.py", language="bash")
+    
+    st.subheader("New Features Added")
+    st.write("""
+    ✅ **Whole Page PDF Capture**: When View button is clicked, the entire page is captured as PDF
+    ✅ **PDF Merging**: All PDFs (main page + additional PDFs) are merged into a single file
+    ✅ **PDF Download Option**: Download the merged PDF or individual PDFs
+    ✅ **In-App PDF Viewer**: View PDFs directly in the application
+    ✅ **Database Storage**: All PDFs are stored in the database with proper organization
+    ✅ **Merged PDF Tracking**: Separate tracking for merged PDFs in the database
+    """)
 
 if __name__ == "__main__":
     main()
