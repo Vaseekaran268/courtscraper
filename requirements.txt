@@ -6,6 +6,8 @@ requests
 python-dateutil
 lxml
 openpyxl
+chromedriver-autoinstaller
+webdriver-manager
 
 
 
