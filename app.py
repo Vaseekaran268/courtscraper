@@ -32,13 +32,27 @@ except ImportError:
     PANDAS_AVAILABLE = False
     st.error("Pandas is not installed. Please install it with: pip install pandas")
 
+# Selenium imports with cloud compatibility
 try:
     from selenium import webdriver
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
     from selenium.common.exceptions import TimeoutException, NoSuchElementException
+    
+    # Try different methods for Chrome driver installation
+    try:
+        import chromedriver_autoinstaller
+        CHROME_DRIVER_METHOD = "autoinstaller"
+    except:
+        try:
+            from webdriver_manager.chrome import ChromeDriverManager
+            CHROME_DRIVER_METHOD = "webdriver_manager"
+        except:
+            CHROME_DRIVER_METHOD = "direct"
+    
     SELENIUM_AVAILABLE = True
 except ImportError:
     SELENIUM_AVAILABLE = False
@@ -177,40 +191,69 @@ def get_pdf_from_db(case_id, file_type='main_pdf'):
 
 # ----------------- Scraper Functions -----------------
 def setup_driver():
-    """Setup Chrome driver with options"""
+    """Setup Chrome driver with options for Streamlit Cloud"""
     if not SELENIUM_AVAILABLE:
         st.error("Selenium is not available. Cannot setup browser driver.")
         return None
         
     chrome_options = Options()
-    chrome_options.add_argument("--start-maximized")
+    
+    # Essential options for Streamlit Cloud
+    chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-features=VizDisplayCompositor")
+    chrome_options.add_argument("--remote-debugging-port=9222")
+    chrome_options.add_argument("--window-size=1920,1080")
+    
+    # Additional options for stability
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--disable-software-rasterizer")
+    chrome_options.add_argument("--disable-background-timer-throttling")
+    chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+    chrome_options.add_argument("--disable-renderer-backgrounding")
+    chrome_options.add_argument("--disable-web-security")
+    chrome_options.add_argument("--disable-features=TranslateUI")
+    chrome_options.add_argument("--disable-ipc-flooding-protection")
+    
+    chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
     chrome_options.add_experimental_option('prefs', {
         "download.default_directory": DOWNLOAD_DIR,
         "download.prompt_for_download": False,
         "download.directory_upgrade": True,
-        "plugins.always_open_pdf_externally": True
+        "plugins.always_open_pdf_externally": True,
+        "profile.default_content_setting_values.notifications": 2
     })
     
-    # Check if we're in Streamlit cloud and set appropriate options
-    if os.environ.get('STREAMLIT_SHARING_MODE') or os.environ.get('STREAMLIT_SERVER_HEADLESS'):
-        chrome_options.add_argument("--headless")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--remote-debugging-port=9222")
-    
-    # Try to find Chrome driver automatically
     try:
-        driver = webdriver.Chrome(options=chrome_options)
+        # Method 1: Try chromedriver-autoinstaller
+        if CHROME_DRIVER_METHOD == "autoinstaller":
+            chromedriver_autoinstaller.install()
+            driver = webdriver.Chrome(options=chrome_options)
+        
+        # Method 2: Try webdriver-manager
+        elif CHROME_DRIVER_METHOD == "webdriver_manager":
+            from webdriver_manager.chrome import ChromeDriverManager
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+        
+        # Method 3: Direct approach (for Streamlit Cloud)
+        else:
+            # Streamlit Cloud has Chrome pre-installed, use system Chrome
+            chrome_options.binary_location = "/usr/bin/google-chrome"
+            driver = webdriver.Chrome(options=chrome_options)
+        
         driver.implicitly_wait(10)
         return driver
+        
     except Exception as e:
         st.error(f"Failed to initialize Chrome driver: {e}")
         st.info("""
-        **Troubleshooting tips:**
-        1. Make sure Chrome browser is installed
-        2. Download ChromeDriver from https://chromedriver.chromium.org/
-        3. Add ChromeDriver to your PATH or place it in the same directory
+        **Streamlit Cloud Limitations:**
+        - Selenium may not work reliably on Streamlit Cloud due to browser restrictions
+        - Consider using a dedicated cloud service for web scraping
+        - Alternative: Use requests + BeautifulSoup for simpler scraping tasks
         """)
         return None
 
@@ -225,7 +268,7 @@ def save_captcha_image(driver, save_path="captcha.png"):
             captcha_img.screenshot(save_path)
             return save_path
         cookies = {c['name']: c['value'] for c in driver.get_cookies()}
-        headers = {"User-Agent": "Mozilla/5.0"}
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
         r = requests.get(src, headers=headers, cookies=cookies, stream=True, timeout=15)
         if r.status_code == 200:
             with open(save_path, "wb") as f:
@@ -240,7 +283,8 @@ def download_file(url, dst_folder=DOWNLOAD_DIR):
     try:
         os.makedirs(dst_folder, exist_ok=True)
         local_name = os.path.join(dst_folder, os.path.basename(urlparse(url).path) or "file.pdf")
-        with requests.get(url, stream=True, timeout=30) as r:
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+        with requests.get(url, headers=headers, stream=True, timeout=30) as r:
             r.raise_for_status()
             with open(local_name, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
@@ -356,7 +400,7 @@ def extract_cases_from_soup(soup_obj):
     return cases
 
 def find_and_click_view_button(driver, serial_number):
-    """Find and click the View button for a specific serial number with multiple strategies"""
+    """Find and click the View button for a specific serial number"""
     try:
         # Wait for the page to load completely
         time.sleep(2)
@@ -386,22 +430,6 @@ def find_and_click_view_button(driver, serial_number):
                 driver.execute_script("arguments[0].click();", view_links_in_row[0])
                 time.sleep(3)
                 return True
-        except:
-            pass
-        
-        # Strategy 3: Look for any clickable element in the same row as serial
-        try:
-            serial_element = driver.find_element(By.XPATH, f"//td[contains(., '{serial_number}')]")
-            row = serial_element.find_element(By.XPATH, "./..")
-            # Find all links in this row
-            all_links = row.find_elements(By.TAG_NAME, "a")
-            if all_links:
-                # Click the first link that's not empty
-                for link in all_links:
-                    if link.text.strip():
-                        driver.execute_script("arguments[0].click();", link)
-                        time.sleep(3)
-                        return True
         except:
             pass
         
@@ -442,7 +470,7 @@ def click_back_button(driver):
         return False
 
 def capture_case_details_automated(driver, case, status_placeholder):
-    """Automatically capture case details by clicking View button with proper navigation"""
+    """Automatically capture case details by clicking View button"""
     serial = case['serial']
     
     # Update status
@@ -550,11 +578,6 @@ def main():
         ```
         pip install -r requirements.txt
         ```
-        
-        Or install manually:
-        ```
-        pip install streamlit selenium beautifulsoup4 pandas requests python-dateutil lxml openpyxl
-        ```
         """)
         return
     
@@ -577,6 +600,15 @@ def main():
     
     st.title("⚖️ eCourts Case Scraper")
     st.markdown("---")
+    
+    # Show cloud warning
+    if os.environ.get('STREAMLIT_SHARING_MODE'):
+        st.warning("""
+        ⚠️ **Streamlit Cloud Notice**
+        - Selenium may have limitations on Streamlit Cloud
+        - For production use, consider deploying on a cloud service that supports browsers
+        - This demo might work with limited functionality
+        """)
     
     # Sidebar for navigation
     st.sidebar.title("Navigation")
@@ -602,7 +634,7 @@ def scrape_cases_ui():
         st.subheader("Step 1: Initialize Browser Session")
         
         if st.button("Initialize Browser Session"):
-            with st.spinner("Starting browser session..."):
+            with st.spinner("Starting browser session (this may take a moment on Streamlit Cloud)..."):
                 driver = setup_driver()
                 if driver:
                     st.session_state.driver = driver
@@ -613,6 +645,8 @@ def scrape_cases_ui():
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error loading eCourts website: {e}")
+                else:
+                    st.error("Failed to initialize browser. Please check the logs for details.")
     
     # Step 2: CAPTCHA Handling
     elif st.session_state.current_step == 2:
@@ -623,6 +657,8 @@ def scrape_cases_ui():
             captcha_file = save_captcha_image(st.session_state.driver)
             if captcha_file:
                 st.image(captcha_file, caption="CAPTCHA Image", use_column_width=True)
+            else:
+                st.warning("Could not load CAPTCHA image. The page might not have loaded correctly.")
             
             captcha_value = st.text_input("Enter CAPTCHA value:")
             
@@ -689,7 +725,7 @@ def process_scraping():
         status_placeholder.info("Scraping cases from pages...")
         all_cases = []
         page_index = 1
-        max_pages = 10  # Safety limit
+        max_pages = 5  # Reduced for Streamlit Cloud
         
         while page_index <= max_pages:
             status_placeholder.info(f"Scraping page {page_index}...")
@@ -705,14 +741,14 @@ def process_scraping():
                 if next_btn.is_enabled():
                     next_btn.click()
                     page_index += 1
-                    time.sleep(1.5)
+                    time.sleep(2)  # Increased delay for cloud
                     continue
             except:
                 try:
                     next_btn = driver.find_element(By.XPATH, "//a[contains(@class,'next') or contains(@aria-label,'Next')]")
                     next_btn.click()
                     page_index += 1
-                    time.sleep(1.5)
+                    time.sleep(2)  # Increased delay for cloud
                     continue
                 except:
                     break
@@ -792,7 +828,7 @@ def perform_capture():
     if current_index < len(matches):
         case = matches[current_index]
         
-        # Update progress (0.0 to 1.0) - FIXED: Use proper fraction
+        # Update progress (0.0 to 1.0)
         progress_fraction = current_index / len(matches)
         progress_bar.progress(progress_fraction)
         
@@ -917,21 +953,35 @@ def settings_ui():
 def installation_guide_ui():
     st.header("Installation Guide")
     
-    st.subheader("Step 1: Install Dependencies")
+    st.subheader("For Streamlit Cloud Deployment")
     st.code("""
-pip install streamlit==1.28.0 selenium==4.15.0 beautifulsoup4==4.12.2 
-pandas==2.0.3 requests==2.31.0 python-dateutil==2.8.2 lxml==4.9.3 openpyxl==3.1.2
-""", language="bash")
+# requirements.txt for Streamlit Cloud
+streamlit==1.28.0
+selenium==4.15.0
+beautifulsoup4==4.12.2
+pandas==2.0.3
+requests==2.31.0
+python-dateutil==2.8.2
+lxml==4.9.3
+openpyxl==3.1.2
+chromedriver-autoinstaller==0.4.0
+webdriver-manager==4.0.1
+    """, language="bash")
     
-    st.subheader("Step 2: Install Chrome Driver")
+    st.subheader("Deployment Steps")
     st.write("""
-    1. Download ChromeDriver from [https://chromedriver.chromium.org/](https://chromedriver.chromium.org/)
-    2. Make sure it matches your Chrome browser version
-    3. Add ChromeDriver to your system PATH or place it in the same directory as this script
+    1. Push this code to GitHub
+    2. Connect your GitHub repo to Streamlit Cloud
+    3. Set the main file path to `app.py`
+    4. Deploy and test
     """)
     
-    st.subheader("Step 3: Run the Application")
-    st.code("streamlit run app.py", language="bash")
+    st.warning("""
+    **Important Notes for Streamlit Cloud:**
+    - Selenium may have limited functionality
+    - Timeouts and memory limits apply
+    - Consider using a dedicated cloud service for production
+    """)
 
 if __name__ == "__main__":
     main()
